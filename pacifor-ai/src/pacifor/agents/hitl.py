@@ -1,28 +1,47 @@
 """
-HITL gate helper.
+HITL gate helper used inside LangGraph nodes.
 
-Calling hitl_gate() inside a node:
-  1. Emits an audit event (action="hitl_interrupt", outcome="pending")
-  2. Calls LangGraph's interrupt() — pauses the graph and hands the review
-     payload to the caller
-  3. When the human approves/rejects via API, the graph is resumed with
-     Command(resume={"approved": bool, "reason": str})
-  4. Emits a second audit event with the decision outcome
-  5. Raises HITLRejected if the human rejected; otherwise returns updated state
+Flow (single reviewer_node execution):
+  Pass 1 — graph.ainvoke() first call:
+    1. Emit audit(action="hitl_interrupt", outcome="pending")
+    2. interrupt(payload) raises GraphInterrupt → graph pauses, thread saved to checkpointer
+    3. Caller (run_service) sees NodeInterrupt, stores review_id for human action
+
+  Pass 2 — graph.ainvoke(Command(resume=decision)):
+    1. LangGraph restores thread and re-enters the node; interrupt() returns `decision`
+    2. Validate decision dict
+    3. Emit audit(action="hitl_decision", outcome="approved"|"rejected")
+    4. Raise HITLRejected on rejection; return {"hitl_approved": True} on approval
+
+Returns a *partial* state update dict — LangGraph merges it into the graph state.
 """
 import uuid
 from typing import Any
 
 from langgraph.types import interrupt
 
-from pacifor.core.audit import AuditEvent, audit_logger
+from pacifor.core.audit import AuditEvent, AuditLogger, audit_logger as _global_audit_logger
 from pacifor.core.exceptions import HITLRejected
 
 
-async def hitl_gate(state: dict, *, node_name: str, payload: dict[str, Any]) -> dict:
+async def hitl_gate(
+    state: dict,
+    *,
+    node_name: str,
+    payload: dict[str, Any],
+    logger: AuditLogger = _global_audit_logger,
+) -> dict:
+    """
+    Pause execution at a HITL checkpoint and wait for human approval.
+
+    Returns a partial state update: {"hitl_approved": True}.
+    Raises HITLRejected if the human rejects.
+
+    `logger` can be injected in tests to avoid touching the global AuditLogger.
+    """
     review_id = str(uuid.uuid4())
 
-    await audit_logger.emit(
+    await logger.emit(
         AuditEvent.build(
             run_id=state["run_id"],
             node_name=node_name,
@@ -34,11 +53,15 @@ async def hitl_gate(state: dict, *, node_name: str, payload: dict[str, Any]) -> 
         )
     )
 
-    decision: dict = interrupt({"review_id": review_id, "payload": payload})
+    # Pauses on pass 1; returns decision on pass 2 after Command(resume=decision).
+    raw_decision: Any = interrupt({"review_id": review_id, "payload": payload})
+
+    # Treat non-dict or missing "approved" as rejection — safety default.
+    decision: dict = raw_decision if isinstance(raw_decision, dict) else {}
     approved: bool = bool(decision.get("approved", False))
     outcome = "approved" if approved else "rejected"
 
-    await audit_logger.emit(
+    await logger.emit(
         AuditEvent.build(
             run_id=state["run_id"],
             node_name=node_name,
@@ -53,4 +76,4 @@ async def hitl_gate(state: dict, *, node_name: str, payload: dict[str, Any]) -> 
     if not approved:
         raise HITLRejected(review_id=review_id, node_name=node_name)
 
-    return {**state, "hitl_approved": True}
+    return {"hitl_approved": True}
